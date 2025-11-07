@@ -1,0 +1,10 @@
+# VSCode
+.vscode/
+
+# Data
+*.csv
+
+# Python / dependencies
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
