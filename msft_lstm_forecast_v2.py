@@ -1,14 +1,10 @@
 """
-msft_lstm_forecast_v2.py
+msft_lstm_forecast_v3.py
 ---------------------------------
 Microsoft (MSFT) stock price forecasting using a Bidirectional LSTM model.
-✅ Optimized for 2016–2025 data
-✅ 60-day lookback window
-✅ MinMax scaling
-✅ Bidirectional LSTM + Dropout + BatchNormalization
-✅ Learning rate scheduling & early stopping
-✅ Robust date-based train/val/test split
-✅ Actual vs Predicted visualization
+✅ Uses saved scaler (joblib)
+✅ Adds Technical Indicators (EMA20, EMA50, RSI, MACD)
+✅ Predicts UP / DOWN classification & prints scikit-learn classification report
 """
 
 # ============================================================
@@ -19,12 +15,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import datetime
 import yfinance as yf
+
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, classification_report
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 from tensorflow.keras.optimizers import Adam
+
+### scaler saving
+import joblib
 
 # ============================================================
 # 2️⃣ Download and prepare data
@@ -32,28 +32,39 @@ from tensorflow.keras.optimizers import Adam
 ticker = "MSFT"
 data = yf.download(ticker, start="2016-01-01", end="2025-11-06")
 
-# Drop multi-level columns if needed
 if isinstance(data.columns, pd.MultiIndex):
     data.columns = data.columns.droplevel(1)
 
-# Select Close price and clean
-data = data[['Close']].copy()
+# ============================================================
+# ✅ Add Technical Indicators
+# ============================================================
+data["EMA20"] = data["Close"].ewm(span=20).mean()
+data["EMA50"] = data["Close"].ewm(span=50).mean()
+data["RSI"] = 100 - (100 / (1 + data["Close"].pct_change().rolling(14).mean()))
+data["MACD"] = data["Close"].ewm(span=12).mean() - data["Close"].ewm(span=26).mean()
+
+# Select Close & indicators
+data = data[["Close", "EMA20", "EMA50", "RSI", "MACD"]].copy()
 data.dropna(inplace=True)
 
-# Scale the data
+# ============================================================
+# ✅ Save scaler
+# ============================================================
 scaler = MinMaxScaler()
-data['Close'] = scaler.fit_transform(data[['Close']])
+scaled = scaler.fit_transform(data)
+joblib.dump(scaler, "scaler.pkl")  
+print("✅ Scaler saved to scaler.pkl")
 
-print(f"✅ Data loaded. Shape: {data.shape}")
-print(data.head())
+data_scaled = pd.DataFrame(scaled, index=data.index, columns=data.columns)
+
+print(f"✅ Data loaded and scaled. Shape: {data_scaled.shape}")
+print(data_scaled.head())
 
 # ============================================================
-# 3️⃣ Create windowed dataset
+# 3️⃣ Create Windowed Dataset
 # ============================================================
 def df_to_windowed_df(dataframe, first_date_str, last_date_str, n=60):
-    """Convert a time series into a supervised windowed dataset."""
-    def str_to_datetime(s):
-        return datetime.datetime.strptime(s, "%Y-%m-%d")
+    def str_to_datetime(s): return datetime.datetime.strptime(s, "%Y-%m-%d")
 
     first_date = str_to_datetime(first_date_str)
     last_date = str_to_datetime(last_date_str)
@@ -65,136 +76,123 @@ def df_to_windowed_df(dataframe, first_date_str, last_date_str, n=60):
     i = all_dates.index(target_date)
 
     while True:
-        if i - n < 0:
-            break
-        window = dataframe.iloc[i - n:i + 1]['Close'].to_numpy()
-        if len(window) != n + 1:
-            break
+        if i - n < 0: break
+
+        window = dataframe.iloc[i - n:i + 1].to_numpy()   # (61, 5 features)
+        if len(window) != n + 1: break
 
         x = window[:-1]
-        y = window[-1]
+        y = window[-1][0]  # predict CLOSE only
+
         dates.append(all_dates[i])
         X.append(x)
         Y.append(y)
 
-        if all_dates[i] == last_date:
-            break
+        if all_dates[i] == last_date: break
         i += 1
-        if i >= len(all_dates):
-            break
+        if i >= len(all_dates): break
 
-    X = np.array(X)
-    windowed_df = pd.DataFrame({'Target Date': dates})
-    for j in range(n):
-        windowed_df[f'Target-{n-j}'] = X[:, j]
-    windowed_df['Target'] = Y
+    return pd.DataFrame({"Target Date": dates, "X": X, "Y": Y})
 
-    return windowed_df
-
-# Build windowed dataframe (ensure we have 60 days before first target)
-windowed_df = df_to_windowed_df(data, '2017-03-01', '2025-11-05', n=60)
-print(f"✅ Windowed dataframe created: {windowed_df.shape}")
-print(windowed_df.head())
+windowed_df = df_to_windowed_df(data_scaled, "2017-03-01", "2025-11-05", n=60)
+print(f"✅ Windowed dataset created: {windowed_df.shape}")
 
 # ============================================================
-# 4️⃣ Convert to X, y, dates
+# 4️⃣ Convert to X, y
 # ============================================================
-def windowed_df_to_date_X_y(windowed_dataframe):
-    df_as_np = windowed_dataframe.to_numpy()
-    dates = df_as_np[:, 0]
-    middle_matrix = df_as_np[:, 1:-1]
-    X = middle_matrix.reshape((len(dates), middle_matrix.shape[1], 1))
-    Y = df_as_np[:, -1]
-    return dates, X.astype(np.float32), Y.astype(np.float32)
-
-dates, X, y = windowed_df_to_date_X_y(windowed_df)
+dates = windowed_df["Target Date"].to_numpy()
+X = np.stack(windowed_df["X"].values)
+y = np.stack(windowed_df["Y"].values).astype(np.float32)
 
 # ============================================================
-# 5️⃣ Time-based train/val/test split
+# 5️⃣ Time-based Split
 # ============================================================
-split_date_1 = '2022-01-01'
-split_date_2 = '2024-01-01'
+dates = pd.to_datetime(dates)
 
-train_mask = dates < split_date_1
-val_mask = (dates >= split_date_1) & (dates < split_date_2)
-test_mask = dates >= split_date_2
+train = dates < "2022-01-01"
+val = (dates >= "2022-01-01") & (dates < "2024-01-01")
+test = dates >= "2024-01-01"
 
-dates_train, X_train, y_train = dates[train_mask], X[train_mask], y[train_mask]
-dates_val, X_val, y_val = dates[val_mask], X[val_mask], y[val_mask]
-dates_test, X_test, y_test = dates[test_mask], X[test_mask], y[test_mask]
+X_train, y_train = X[train], y[train]
+X_val, y_val = X[val], y[val]
+X_test, y_test = X[test], y[test]
 
-print(f"✅ Split complete: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
-
-# ============================================================
-# 6️⃣ Visualize splits
-# ============================================================
-plt.figure(figsize=(12, 6))
-plt.plot(dates_train, y_train, label="Train")
-plt.plot(dates_val, y_val, label="Validation")
-plt.plot(dates_test, y_test, label="Test")
-plt.title("Train / Validation / Test Split")
-plt.legend()
-plt.show()
+print(f"✅ Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
 
 # ============================================================
-# 7️⃣ Build Bidirectional LSTM model
+# 6️⃣ Build Model
 # ============================================================
 model = Sequential([
-    Bidirectional(LSTM(128, return_sequences=True), input_shape=(60, 1)),
+    Bidirectional(LSTM(128, return_sequences=True), input_shape=(60, X.shape[2])),
     Dropout(0.3),
     Bidirectional(LSTM(128)),
     BatchNormalization(),
-    Dense(64, activation='relu'),
+    Dense(64, activation="relu"),
     Dropout(0.3),
     Dense(1)
 ])
 
-model.compile(loss='mse', optimizer=Adam(learning_rate=0.0005), metrics=['mean_absolute_error'])
+model.compile(loss="mse", optimizer=Adam(learning_rate=0.0005), metrics=["mean_absolute_error"])
 model.summary()
 
 # ============================================================
-# 8️⃣ Callbacks
+# 7️⃣ Train
 # ============================================================
-lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1)
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+callbacks = [
+    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, verbose=1),
+    EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+]
 
-# ============================================================
-# 9️⃣ Train model
-# ============================================================
 history = model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
     epochs=200,
     batch_size=32,
-    callbacks=[lr_scheduler, early_stopping],
+    callbacks=callbacks,
     verbose=1
 )
 
+model.save("msft_bilstm_60day.h5")
+print("✅ Model saved as msft_bilstm_60day.h5")
+
 # ============================================================
-# 🔟 Evaluate on test set
+# 8️⃣ Evaluate (Regression Metrics)
 # ============================================================
 loss, mae = model.evaluate(X_test, y_test)
 print(f"\n✅ Test MSE: {loss:.6f} | Test MAE: {mae:.6f}")
 
-# ============================================================
-# 11️⃣ Predict and visualize
-# ============================================================
 y_pred = model.predict(X_test)
-y_pred_rescaled = scaler.inverse_transform(y_pred)
-y_test_rescaled = scaler.inverse_transform(y_test.reshape(-1, 1))
 
-# Metrics
+scaler = joblib.load("scaler.pkl") 
+y_pred_rescaled = scaler.inverse_transform(
+    np.hstack([y_pred, np.zeros((len(y_pred), 4))])
+)[:, 0]
+
+y_test_rescaled = scaler.inverse_transform(
+    np.hstack([y_test.reshape(-1, 1), np.zeros((len(y_test), 4))])
+)[:, 0]
+
 rmse = np.sqrt(mean_squared_error(y_test_rescaled, y_pred_rescaled))
-mae_rescaled = mean_absolute_error(y_test_rescaled, y_pred_rescaled)
-print(f"✅ RMSE: {rmse:.4f} | MAE: {mae_rescaled:.4f}")
+print(f"✅ RMSE: {rmse:.2f} | MAE: {mae:.2f}")
 
-# Plot predictions
-plt.figure(figsize=(12,6))
-plt.plot(dates_test, y_test_rescaled, label="Actual", color='blue')
-plt.plot(dates_test, y_pred_rescaled, label="Predicted", color='red')
-plt.title("MSFT Close Price Prediction (Bidirectional LSTM, 60-day Window)")
+# ============================================================
+# Classification (Up/Down Prediction)
+# ============================================================
+y_test_updown = np.where(np.diff(y_test_rescaled, prepend=y_test_rescaled[0]) > 0, 1, 0)
+y_pred_updown = np.where(np.diff(y_pred_rescaled, prepend=y_pred_rescaled[0]) > 0, 1, 0)
+
+print("\n📊 UP / DOWN Classification Report:")
+print(classification_report(y_test_updown, y_pred_updown, target_names=["DOWN", "UP"]))
+
+# ============================================================
+# 🔟 Visualization
+# ============================================================
+plt.figure(figsize=(12, 6))
+plt.plot(dates[test], y_test_rescaled, label="Actual")
+plt.plot(dates[test], y_pred_rescaled, label="Predicted")
+plt.title("MSFT Close Price Prediction (Bidirectional LSTM, 60-day Window + Indicators)")
 plt.xlabel("Date")
-plt.ylabel("Price (USD)")
+plt.ylabel("Close Price (USD)")
 plt.legend()
-plt.grid(True)
+plt.grid()
 plt.show()
